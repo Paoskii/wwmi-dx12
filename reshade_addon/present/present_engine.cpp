@@ -396,7 +396,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
             if (g_frame_id % 600u == 300u) TexPlacementReport();
             if (g_frame_id % 10u == 0u)
                 for (GeoMod& gm : g_geomods)
-                    if (gm.det_at_keys > 0.f) TexSnapshotSelections(gm.wcl_ns.c_str());
+                    if (gm.det_at_keys > 0.f && gm.geom_enabled) TexSnapshotSelections(gm.wcl_ns.c_str());
             static uint32_t s_held_retry_frame = 0;
             if (on_screen && g_frame_id - s_held_retry_frame >= 30) {
                 s_held_retry_frame = g_frame_id;

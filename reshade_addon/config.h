@@ -123,6 +123,10 @@ inline std::atomic<uint64_t>    g_x32_mid_skipped_total{ 0 };
 inline bool             g_sk_strict_owner = true;
 inline std::atomic<int> g_vbdiag_frames{ 0 };
 inline bool             g_skel_copies = true;             // one merged skeleton per copy of a character in a frame (B20)
+// Bumped when the add-on is turned back on. Copy tracking must drop the previous enable's slots:
+// those skeletons are not filled again until a draw merges into them, and a stale match binds a
+// character to an empty one.
+inline std::atomic<unsigned> g_skel_copy_epoch{ 1 };
 inline int              g_dbg_comp5_suppress_rtv = -1;    // bow A/B: drop comp5 passes with this rtv count
 inline bool             g_skip_translucent_cloth = false; // bow A/B: drop the modded comp's 2-RT pass
 

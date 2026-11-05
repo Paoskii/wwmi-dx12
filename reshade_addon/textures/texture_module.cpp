@@ -335,6 +335,7 @@ void TexPlacementReport()
 struct SelSnap {
     int      sel;
     uint32_t frame;
+    uint64_t ns = 0; // which mod wrote it; another mod's "nothing" must not erase it
 };
 static std::shared_mutex                     g_sel_snap_mtx;
 static std::unordered_map<uint32_t, SelSnap> g_sel_snap;
@@ -480,17 +481,30 @@ void TexRetryMissed(const char* why, bool quiet_if_none)
 
 static std::unordered_set<uint32_t> TexRulesOfNs(const wchar_t* ns);
 
+static uint64_t SnapshotNsKey(const wchar_t* ns)
+{
+    uint64_t h = 14695981039346656037ull;
+    if (ns)
+        for (; *ns; ++ns) h = (h ^ (uint64_t)(unsigned)*ns) * 1099511628211ull;
+    return h;
+}
+
 void TexSnapshotSelections(const wchar_t* ns)
 {
     if (!ns || !*ns) return;
+    // This mod's own sections only. A global select runs every outfit that shares the vanilla
+    // hash, and the last one in load order used to overwrite -- or erase -- the active outfit.
+    const uint64_t                        nk = SnapshotNsKey(ns);
     std::vector<std::pair<uint32_t, int>> sel;
-    for (uint32_t r : TexRulesOfNs(ns)) sel.emplace_back(r, TexSelectIdx(r, ModLoader::kTexMipUnknown));
+    for (uint32_t r : TexRulesOfNs(ns)) sel.emplace_back(r, TexSelectIdxNs(r, ns, ModLoader::kTexMipUnknown));
     std::unique_lock l(g_sel_snap_mtx);
-    for (const auto& [r, s] : sel)
+    for (const auto& [r, s] : sel) {
+        auto it = g_sel_snap.find(r);
         if (s >= 0)
-            g_sel_snap[r] = SelSnap{ s, g_frame_id };
-        else
-            g_sel_snap.erase(r);
+            g_sel_snap[r] = SelSnap{ s, g_frame_id, nk };
+        else if (it != g_sel_snap.end() && it->second.ns == nk)
+            g_sel_snap.erase(it);
+    }
 }
 
 void TexSnapshotsMove(const std::unordered_map<int, int>& index_to)

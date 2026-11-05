@@ -56,6 +56,7 @@ constexpr unsigned            kSkOversplitFrames = 3;
 static std::mutex             g_skcopy_mtx;
 static std::vector<SkCopyMod> g_skcopy;
 static unsigned               g_skcopy_gen = ~0u;
+static unsigned               g_skcopy_epoch = 0;
 
 static SkBones SkBonesOf(ID3D12Resource* res, uint64_t va)
 {
@@ -148,8 +149,11 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
     if (!key) return 0;
     std::lock_guard l(g_skcopy_mtx);
     const unsigned  gen = PortApi::LoadGeneration();
-    if (g_skcopy_gen != gen) {
+    const unsigned  epoch = g_skel_copy_epoch.load(std::memory_order_acquire);
+    // Ini reload, or F6 back on: the slots named skeletons that are not filled anymore.
+    if (g_skcopy_gen != gen || g_skcopy_epoch != epoch) {
         g_skcopy_gen = gen;
+        g_skcopy_epoch = epoch;
         g_skcopy.clear();
     }
     if (g_skcopy.size() <= (size_t)dm) g_skcopy.resize((size_t)dm + 1);
@@ -160,19 +164,41 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
     }
     if (m.off) return 0;
     if (m.frame != g_frame_id) {
-        SkCopyRoll(m, dm);
+        // A gap (the character left, an area load, F6 held across frames) must not match the next
+        // scene to the previous scene's bones. That match sticks, and the slot it picks is a
+        // skeleton nothing merges into for the new scene.
+        if (m.frame && g_frame_id - m.frame > 2) {
+            m.cur.clear();
+            m.prev_slots.clear();
+            m.prev_bones.clear();
+            m.prev_keys.clear();
+            m.oversplit = 0;
+            m.off = false;
+        } else {
+            SkCopyRoll(m, dm);
+        }
         m.frame = g_frame_id;
         if (m.off) return 0;
     }
+    // A slot already holds a different pose for this object. The body and the floating sword (and
+    // two passes of one mesh) can share vs-cb2 while their bone CBs differ. Putting both on one
+    // skeleton makes the second draw see merge_status already finished and skip its own merge.
+    auto bone_conflict = [&](const SkCopySeen& e) {
+        // Same component only. Another component of this copy may use its own bone CB and must
+        // still merge into this skeleton.
+        if (shadow || !cb4_va || (size_t)comp >= e.cb4.size()) return false;
+        const uint64_t had = e.cb4[comp].va;
+        return had && had != cb4_va;
+    };
     size_t at = m.cur.size();
-    for (size_t i = 0; i < m.cur.size(); ++i)
-        if (m.cur[i].key == key || std::find(m.cur[i].keys.begin(), m.cur[i].keys.end(), key) != m.cur[i].keys.end()) at = i;
-    if (at == m.cur.size() && cb4_va)
+    // Same bone CB already drawn this frame: this is that copy, whichever per-object address it used.
+    if (cb4_va)
         for (size_t i = 0; i < m.cur.size(); ++i) {
             SkCopySeen& o = m.cur[i];
             if (std::find(o.cb4_drawn.begin(), o.cb4_drawn.end(), cb4_va) == o.cb4_drawn.end()) continue;
+            if (bone_conflict(o)) continue;
             at = i;
-            o.keys.push_back(key);
+            if (o.key != key && std::find(o.keys.begin(), o.keys.end(), key) == o.keys.end()) o.keys.push_back(key);
             if (DiagOnce("SKCOPIES-JOINED", dm))
                 logger::write("SKCOPIES mod=%d comp=%d f=%u: vs-cb2 %llx is drawn with bone CB %llx, already drawn this frame "
                               "under vs-cb2 %llx -- the same copy, on its skeleton #%u",
@@ -185,18 +211,36 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
                     (unsigned long long)o.key);
             break;
         }
+    bool bones_differ = false;
+    if (at == m.cur.size())
+        for (size_t i = 0; i < m.cur.size(); ++i) {
+            const bool keyhit = m.cur[i].key == key ||
+                std::find(m.cur[i].keys.begin(), m.cur[i].keys.end(), key) != m.cur[i].keys.end();
+            if (!keyhit) continue;
+            if (bone_conflict(m.cur[i])) {
+                bones_differ = true;
+                continue;
+            }
+            at = i;
+        }
     auto prev_slot_of = [&](uint64_t k) {
         unsigned s = ~0u;
+        unsigned n = 0;
         for (const auto& pk : m.prev_keys)
-            if (pk.first == k) s = pk.second;
-        return s;
+            if (pk.first == k) {
+                s = pk.second;
+                ++n;
+            }
+        // One address owned two slots last frame (two bone CBs). The address does not say which.
+        return n == 1 ? s : ~0u;
     };
     const unsigned was = prev_slot_of(key);
     if (at == m.cur.size() && was != ~0u)
         for (size_t i = 0; i < m.cur.size(); ++i)
-            if (m.cur[i].slot == was && prev_slot_of(m.cur[i].key) == was) {
+            if (m.cur[i].slot == was && prev_slot_of(m.cur[i].key) == was && !bone_conflict(m.cur[i])) {
                 at = i;
-                m.cur[i].keys.push_back(key);
+                if (std::find(m.cur[i].keys.begin(), m.cur[i].keys.end(), key) == m.cur[i].keys.end() && m.cur[i].key != key)
+                    m.cur[i].keys.push_back(key);
                 break;
             }
     if (at == m.cur.size()) {
@@ -229,7 +273,10 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
             }
             if (slot != ~0u) why = "nearest bones of last frame";
         }
-        if (slot == ~0u)
+        // A second pose under the same per-object address must not be glued to whichever slot
+        // happens to be free. That is how a floating-sword draw inherited the body's skeleton
+        // and then kept it. Bones, or a new slot, decide.
+        if (slot == ~0u && !bones_differ)
             for (unsigned k : m.prev_slots)
                 if (free_slot(k)) {
                     slot = k;
@@ -241,6 +288,10 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
             while (!free_slot(slot)) ++slot;
         }
         m.cur.push_back(SkCopySeen{ key, slot });
+        if (bones_differ && DiagOnce("SKCOPIES-SHARED", dm))
+            logger::write("SKCOPIES mod=%d comp=%d f=%u: vs-cb2 %llx is also drawn with bone CB %llx -- a different pose "
+                          "under one per-object address gets its own skeleton #%u, so its merge is not skipped",
+                dm, comp, g_frame_id, (unsigned long long)key, (unsigned long long)cb4_va, slot);
         if (was != ~0u && was != slot && g_debug && LogBudget("SKCOPIES-MOVED", g_geomods[dm].wcl_ns, 64))
             logger::write("SKCOPIES-MOVED mod=%d comp=%d f=%u: vs-cb2 %llx drew on skeleton #%u last frame, now on #%u (%s, rms %.3f)",
                 dm, comp, g_frame_id, (unsigned long long)key, was, slot, why, best);
@@ -264,11 +315,13 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
         if (!e.cb4[comp].va) {
             e.cb4[comp].va = cb4_va;
             e.cb4[comp].bones = SkBonesOf(cb4_res, cb4_va);
-        } else if (e.cb4[comp].va != cb4_va && DiagOnce("SKCOPIES-SHARED", dm)) {
-            logger::write("SKCOPIES mod=%d comp=%d f=%u: vs-cb2 %llx is drawn with two bone CBs (%llx, %llx) -- copies under "
-                          "one per-object address share one skeleton",
+        } else if (e.cb4[comp].va != cb4_va && DiagOnce("SKCOPIES-SHARED-STUCK", dm)) {
+            // The split above should have given this bone CB its own slot. Reaching here means a
+            // draw still merged into a skeleton another pose already filled.
+            logger::write("SKCOPIES mod=%d comp=%d f=%u: vs-cb2 %llx is drawn with two bone CBs (%llx, %llx) on skeleton "
+                          "#%u -- the second pose's merge is skipped",
                 dm, comp, g_frame_id, (unsigned long long)key, (unsigned long long)e.cb4[comp].va,
-                (unsigned long long)cb4_va);
+                (unsigned long long)cb4_va, e.slot);
         }
     }
     return e.slot;
@@ -470,7 +523,10 @@ static uint16_t PublishSectionTextures(reshade::api::command_list* cmd_list, int
     const uint64_t pass = TexLookPlaceOf(g_geomods[dm].wcl_ns.c_str(), comp, ps_hash);
     const bool     every_slot = g_geomods[dm].mod.queries_ps_slots;
     device*        dev = cmd_list->get_device();
-    ForEachPsTexture(cmd_list, g_debug, ps_regs, [](unsigned) { return true; }, [&](const PsTexture& t) {
+    // `unread`: a register the pixel shader's PSV does not list can still be one the mod's
+    // CheckTextureOverride matches. Skipping it unless debug logging is on made the swap depend
+    // on whether that PSV had been parsed yet.
+    ForEachPsTexture(cmd_list, true, ps_regs, [](unsigned) { return true; }, [&](const PsTexture& t) {
         const unsigned    r = t.reg;
         const bool        read = t.read;
         const TableStart& ts = t.ts;
@@ -483,7 +539,11 @@ static uint16_t PublishSectionTextures(reshade::api::command_list* cmd_list, int
             : TexLodTargetOf(resident);
         const bool known = hash && PortApi::TextureHashHasSections(hash);
         if (!known && !(every_slot && read)) return;
-        if (read) {
+        // DX11 runs CheckTextureOverride on whatever is bound, whether or not the shader's
+        // reflection lists the register. A parsed PSV that omits the register used to drop the
+        // hash ("not published"): the section then left that part of the outfit on the vanilla
+        // texture, and which registers were parsed yet depended on load order.
+        if (read || known) {
             const unsigned fmt = every_slot && ri.view_handle
                 ? (unsigned)dev->get_resource_view_desc(resource_view{ ri.view_handle }).format
                 : 0u;
@@ -507,8 +567,9 @@ static uint16_t PublishSectionTextures(reshade::api::command_list* cmd_list, int
                     g_frame_id, dm, comp, r, rtv_count, hash, lod, (void*)ri.res, (unsigned long long)ts.heap,
                     ts.base + t.offset, g_frame_id - ri.wrote_frame, (unsigned)ri.wrote_src,
                     (unsigned long long)ps_hash,
-                    !read ? "does NOT read it: not published" : ps_regs.parsed ? "reads it"
-                                                                               : "(no PSV) published",
+                    !read ? "PSV does not list it: published, the mod has a section for this hash"
+                          : ps_regs.parsed ? "reads it"
+                                           : "(no PSV) published",
                     appeared ? "first sighting in 30+ frames" : "watch: a mod switched itself back on");
             }
         }

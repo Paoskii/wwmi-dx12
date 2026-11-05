@@ -86,6 +86,29 @@ const ReadSlots& DrawReadSlots(reshade::api::command_list* cmd_list)
     return m.rs;
 }
 
+// The claim's mod is whichever sibling was loaded last for this mesh range. A disabled outfit
+// still owns that claim, and selecting textures in its namespace returns nothing (it is switched
+// off) so the vanilla hash stays in the descriptor. Later toggles never re-evaluate it. The
+// enabled sibling is the one whose sections should run.
+static const wchar_t* TextureNsForClaim(const MergedComp* mc)
+{
+    if (!mc) return nullptr;
+    auto ns_if_enabled = [](int mod) -> const wchar_t* {
+        if (mod < 0 || mod >= (int)g_geomods.size()) return nullptr;
+        const GeoMod& gm = g_geomods[mod];
+        if (gm.wcl_ns.empty() || !gm.geom_enabled) return nullptr;
+        return gm.wcl_ns.c_str();
+    };
+    if (const wchar_t* n = ns_if_enabled(mc->mod_id)) return n;
+    for (const int s : mc->run_order) {
+        if (s < 0 || s >= (int)g_merged_comps.size()) continue;
+        if (const wchar_t* n = ns_if_enabled(g_merged_comps[s].mod_id)) return n;
+    }
+    if (mc->mod_id >= 0 && mc->mod_id < (int)g_geomods.size() && !g_geomods[mc->mod_id].wcl_ns.empty())
+        return g_geomods[mc->mod_id].wcl_ns.c_str();
+    return nullptr;
+}
+
 // A mod a claimed draw runs: detected (`$object_detected`) and its textures wanted now.
 static void NoteClaimedMod(int mod_id)
 {
@@ -126,9 +149,7 @@ void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc)
     MergedComp*&                      mc = dc.mc;
     if (mc && g_texovr_ready && !g_disable_tex) {
         PROF(PROF_DI_TexHash);
-        const wchar_t* own_ns = nullptr;
-        if (mc->mod_id >= 0 && mc->mod_id < (int)g_geomods.size() && !g_geomods[mc->mod_id].wcl_ns.empty())
-            own_ns = g_geomods[mc->mod_id].wcl_ns.c_str();
+        const wchar_t* own_ns = TextureNsForClaim(mc);
         NoteClaimedMod(mc->mod_id);
         for (const int s : mc->with) NoteClaimedMod(g_merged_comps[s].mod_id);
         ProfScope   _th_prep(PROF_TH_Prep);

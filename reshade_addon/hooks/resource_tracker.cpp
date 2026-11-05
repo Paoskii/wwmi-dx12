@@ -637,6 +637,10 @@ void SetAddonDisabled(bool dis)
             t.recorded, t.cpu_only, t.cpu_only_stamped);
     } else {
         ResetDescriptorTracking(); // BEFORE the hooks resume: nothing may read a stale slot
+        // The previous enable's copy→skeleton map must not survive. F6 does not reload inis, so
+        // LoadGeneration() stays put and that map would otherwise re-bind a draw to a skeleton
+        // nothing merges into on this enable.
+        g_skel_copy_epoch.fetch_add(1, std::memory_order_acq_rel);
         g_addon_disabled.store(false);
     }
 }
